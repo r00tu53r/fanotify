@@ -4,12 +4,14 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"unsafe"
 
@@ -24,7 +26,7 @@ type FanotifyEventInfoHeader struct {
 }
 
 type kernelFSID struct {
-	val [2]int
+	val [2]int32
 }
 
 // Unique file identifier info record.
@@ -67,6 +69,28 @@ func main() {
 	watch(watchDir)
 }
 
+// function to experiment with various mask settings
+func Mask() (uint64, []string) {
+
+	var maskTable = map[int]string{
+		unix.FAN_ACCESS: "Create an event when a file or directory (but see BUGS) is accessed (read)",
+		unix.FAN_MODIFY: "Create an event when a file is modified (write).",
+		unix.FAN_ONDIR: "Create events for directories when readdir, opendir, closedir are called",
+	}
+	getDesc := func(m uint64) []string {
+		var ret []string
+		for k, v := range maskTable {
+			if m&uint64(k) != 0 {
+				ret = append(ret, v)
+			}
+		}
+		return ret
+	}
+	mask := uint64(unix.FAN_ACCESS | unix.FAN_ONDIR)
+	desc := getDesc(mask)
+	return mask, desc
+}
+
 // watch watches only the specified directory
 func watch(watchDir string) {
 	var flags uint
@@ -81,12 +105,10 @@ func watch(watchDir string) {
 	if errno != nil {
 		log.Fatalf("FanotifyInit: %v", errno)
 	}
-	// mark watch directory for events
-	flags = unix.FAN_MARK_ADD | unix.FAN_MARK_DONT_FOLLOW | unix.FAN_MARK_ONLYDIR
-	mask = unix.FAN_CREATE | unix.FAN_ATTRIB | unix.FAN_DELETE | unix.FAN_MODIFY
-	mask = mask | unix.FAN_DELETE_SELF | unix.FAN_MOVED_FROM | unix.FAN_MOVED_TO
-	mask = mask | unix.FAN_EVENT_ON_CHILD
-	errno = unix.FanotifyMark(fd, flags, mask, unix.AT_FDCWD, watchDir)
+
+	// fanotify_mark
+	mask, desc := Mask()
+	errno = unix.FanotifyMark(fd, unix.FAN_MARK_ADD, mask, unix.AT_FDCWD, watchDir)
 	if errno != nil {
 		log.Fatalf("FanotifyMark: %v", errno)
 	}
@@ -94,7 +116,44 @@ func watch(watchDir string) {
 	var fds [1]unix.PollFd
 	fds[0].Fd = int32(fd)
 	fds[0].Events = unix.POLLIN
+
+	// determine mount_id
+	_, mountID, errno := unix.NameToHandleAt(-1, watchDir, unix.AT_SYMLINK_FOLLOW)
+	if errno != nil {
+		log.Fatalf("NameToHandleAt:", errno)
+	}
+
+	// get mount_fd from the mount_id
+	mountInfo, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		log.Fatalf("Error opening /proc/self/mountinfo:", err)
+	}
+	scanner := bufio.NewScanner(mountInfo)
+	scanner.Split(bufio.ScanLines)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	mountInfo.Close()
+
+	var mountPoint string
+	for _, line := range lines {
+		toks := strings.Split(line, " ")
+		if toks[0] == strconv.Itoa(mountID) {
+			log.Println("Found mount entry:", line)
+			mountPoint = toks[4] // 5th entry is the mount point
+			break
+		}
+	}
+	mountFd, err := unix.Open(mountPoint, unix.O_RDONLY|unix.O_DIRECTORY, unix.S_IRUSR)
+	if err != nil {
+		log.Fatalf("Error opening:", mountPoint, err)
+	}
+
 	log.Println("Listening to events on", watchDir)
+	for _, d := range desc {
+		log.Println(d)
+	}
 	for {
 		n, errno := unix.Poll(fds[:], -1) // blocking
 		if n == 0 {
@@ -106,7 +165,7 @@ func watch(watchDir string) {
 			}
 			log.Fatalf("Poll: %v", errno)
 		}
-		readEvents(fd)
+		readEvents(fd, mountFd)
 	}
 }
 
@@ -116,7 +175,7 @@ func FanotifyEventOK(meta *unix.FanotifyEventMetadata, n int) bool {
 		int(meta.Event_len) <= n)
 }
 
-func readEvents(fd int) error {
+func readEvents(fd, mountFd int) error {
 	var fid *FanotifyEventInfoFID
 	var buf [4096 * SizeOfFanotifyEventMetadata]byte
 	var metadata *unix.FanotifyEventMetadata
@@ -142,16 +201,22 @@ func readEvents(fd int) error {
 			if metadata.Vers != unix.FANOTIFY_METADATA_VERSION {
 				log.Fatalf("Incompatible fanotify version. Rebuild your code.")
 			}
+			// If fanotify_init was initialized with FAN_REPORT_FID then
+			// expect metadata.Fd to be FAN_NOFD
+			if metadata.Fd != unix.FAN_NOFD {
+				log.Fatalf("Error FanotifyInit called with FAN_REPORT_FID. Unexpected Fd:", metadata.Fd)
+			}
 			fid = (*FanotifyEventInfoFID)(unsafe.Pointer(&buf[i+int(metadata.Metadata_len)]))
 			switch {
 			case fid.Header.InfoType == unix.FAN_EVENT_INFO_TYPE_FID:
 				log.Println("FAN_EVENT_INFO_TYPE_FID: identifies non directory object")
-			case fid.Header.InfoType == unix.FAN_EVENT_INFO_TYPE_DFID:
-				log.Println("FAN_EVENT_INFO_TYPE_DFID: identifies parent object")
+			default:
+				log.Fatalf("Unexpected InfoType %d expected %d", fid.Header.InfoType, unix.FAN_EVENT_INFO_TYPE_FID)
 			}
 			if fid.Header.InfoType == unix.FAN_EVENT_INFO_TYPE_FID {
 				// event from FAN_REPORT_FID
-				fd, errno := unix.OpenByHandleAt(unix.AT_FDCWD, fid.fileHandle, unix.O_RDONLY)
+				log.Println("FAN_EVENT_INFO_TYPE_FID case")
+				fd, errno := unix.OpenByHandleAt(mountFd, fid.fileHandle, unix.O_RDONLY)
 				if errno != nil {
 					log.Println("OpenByHandleAt:", errno)
 					i += int(metadata.Event_len)
