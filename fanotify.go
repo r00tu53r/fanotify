@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -201,76 +200,19 @@ func FanotifyEventOK(meta *unix.FanotifyEventMetadata, n int) bool {
 		int(meta.Event_len) <= n)
 }
 
-func debugFIDStruct(metadata *unix.FanotifyEventMetadata, buf []byte, i int) *unix.FileHandle {
-
-	log.Println("***** FID BUFFER DUMP START *****")
-	// buffer test - start
-	fidBuffer := bytes.Buffer{}
-	var idx uint32
-	var jidx uint32
-	idx = uint32(i) + uint32(metadata.Metadata_len)
-	sizeOfFanotifyEventInfoHeader := uint32(unsafe.Sizeof(FanotifyEventInfoHeader{}))
-	for jidx < sizeOfFanotifyEventInfoHeader {
-		fidBuffer.WriteByte(buf[idx])
-		idx += 1
-		jidx += 1
-	}
-	log.Printf("FID.Header (%d) bytes. Idx: %d", sizeOfFanotifyEventInfoHeader, idx)
-	log.Print(hex.Dump(fidBuffer.Bytes()))
-
-	fidBuffer2 := bytes.Buffer{}
-	jidx = 0
-	sizeOfKernelFSIDType := uint32(unsafe.Sizeof(jidx) * 2)
-	for jidx < sizeOfKernelFSIDType {
-		fidBuffer2.WriteByte(buf[idx])
-		idx += 1
-		jidx += 1
-	}
-	log.Printf("FID.FSID (%d) bytes. Idx: %d", sizeOfKernelFSIDType, idx)
-	log.Println(hex.Dump(fidBuffer2.Bytes()))
-
+func getFileHandle(metadataLen uint16, buf []byte, i int) *unix.FileHandle {
 	var fhSize uint32
-	fidBuffer3 := bytes.Buffer{}
-	sizeOfUint32 := uint32(unsafe.Sizeof(fhSize)) // filehandle.size
-	jidx = 0
-	for jidx < sizeOfUint32 {
-		fidBuffer3.WriteByte(buf[idx])
-		idx += 1
-		jidx += 1
-	}
-	log.Printf("FID.file_handle.handle_bytes (%d) bytes, idx: %d", sizeOfUint32, idx)
-	log.Println(hex.Dump(fidBuffer3.Bytes()))
-	binary.Read(bytes.NewReader(fidBuffer3.Bytes()), binary.LittleEndian, &fhSize)
-	log.Println("FID.file_handle.handle_bytes =", fhSize)
-
 	var fhType int32
-	sizeOfInt32 := uint32(unsafe.Sizeof(fhType)) // filehandle.type
-	fidBuffer4 := bytes.Buffer{}
-	jidx = 0
-	for jidx < sizeOfInt32 {
-		fidBuffer4.WriteByte(buf[idx])
-		idx += 1
-		jidx += 1
-	}
-	log.Printf("FID.file_handle.handle_type (%d) bytes, idx: %d", sizeOfInt32, idx)
-	log.Println(hex.Dump(fidBuffer4.Bytes()))
-	binary.Read(bytes.NewReader(fidBuffer4.Bytes()), binary.LittleEndian, &fhType)
-	log.Println("FID.filehandle.handle_type =", fhType)
 
-	fidBuffer5 := bytes.Buffer{}
-	jidx = 0
-	for jidx < fhSize {
-		fidBuffer5.WriteByte(buf[idx])
-		idx += 1
-		jidx += 1
-	}
-	log.Printf("FID.file_handle.handle idx: %d", idx)
-	log.Println(hex.Dump(fidBuffer5.Bytes()))
-	handle := unix.NewFileHandle(fhType, fidBuffer5.Bytes())
-
-	// buffer test - end
-	log.Println("***** FID BUFFER DUMP END *****")
-
+	sizeOfFanotifyEventInfoHeader := uint32(unsafe.Sizeof(FanotifyEventInfoHeader{}))
+	sizeOfKernelFSIDType := uint32(unsafe.Sizeof(kernelFSID{}))
+	sizeOfUint32 := uint32(unsafe.Sizeof(fhSize))
+	j := uint32(i) + uint32(metadataLen) + sizeOfFanotifyEventInfoHeader + sizeOfKernelFSIDType
+	binary.Read(bytes.NewReader(buf[j:j+sizeOfUint32]), binary.LittleEndian, &fhSize)
+	j += sizeOfUint32
+	binary.Read(bytes.NewReader(buf[j:j+sizeOfUint32]), binary.LittleEndian, &fhType)
+	j += sizeOfUint32
+	handle := unix.NewFileHandle(fhType, buf[j:j+fhSize])
 	return &handle
 }
 
@@ -309,7 +251,7 @@ func readEvents(fd, mountFd int) error {
 				fid = (*FanotifyEventInfoFID)(unsafe.Pointer(&buf[i+int(metadata.Metadata_len)]))
 				log.Println("FID (Struct):", fid)
 				var handle *unix.FileHandle
-				handle = debugFIDStruct(metadata, buf[:], i)
+				handle = getFileHandle(metadata.Metadata_len, buf[:], i)
 				log.Print("Handle:")
 				log.Print("Handle.Type:", handle.Type())
 				log.Print("Handle.Size:", handle.Size())
@@ -321,12 +263,6 @@ func readEvents(fd, mountFd int) error {
 					log.Fatalf("Unexpected InfoType %d expected %d", fid.Header.InfoType, unix.FAN_EVENT_INFO_TYPE_FID)
 				}
 				if fid.Header.InfoType == unix.FAN_EVENT_INFO_TYPE_FID {
-					// event from FAN_REPORT_FID
-					log.Println("FAN_EVENT_INFO_TYPE_FID case")
-					log.Println("handle type:", handle.Type())
-					log.Println("handle size:", handle.Size())
-					log.Printf("handle bytes: %v", hex.Dump(handle.Bytes()))
-
 					fd, errno := unix.OpenByHandleAt(mountFd, *handle, unix.O_RDONLY)
 					if errno != nil {
 						log.Println("OpenByHandleAt:", errno)
@@ -384,3 +320,72 @@ func EventMask(mask uint64) string {
 	}
 	return strings.Join(maskStr, ",")
 }
+
+// debug function to extract fileHandle from byte buffer
+// func debugGetFileHandle(metadata *unix.FanotifyEventMetadata, buf []byte, i int) *unix.FileHandle {
+// 	var j uint32
+// 	var k uint32
+//
+// 	fidBuffer := bytes.Buffer{}
+// 	j = uint32(i) + uint32(metadata.Metadata_len)
+// 	sizeOfFanotifyEventInfoHeader := uint32(unsafe.Sizeof(FanotifyEventInfoHeader{}))
+// 	for k < sizeOfFanotifyEventInfoHeader {
+// 		fidBuffer.WriteByte(buf[j])
+// 		j += 1
+// 		k += 1
+// 	}
+// 	log.Printf("FID.Header (%d) bytes. Idx: %d", sizeOfFanotifyEventInfoHeader, j)
+// 	log.Print(hex.Dump(fidBuffer.Bytes()))
+//
+// 	fidBuffer2 := bytes.Buffer{}
+// 	k = 0
+// 	sizeOfKernelFSIDType := uint32(unsafe.Sizeof(k) * 2)
+// 	for k < sizeOfKernelFSIDType {
+// 		fidBuffer2.WriteByte(buf[j])
+// 		j += 1
+// 		k += 1
+// 	}
+// 	log.Printf("FID.FSID (%d) bytes. Idx: %d", sizeOfKernelFSIDType, j)
+// 	log.Print(hex.Dump(fidBuffer2.Bytes()))
+//
+// 	var fhSize uint32
+// 	fidBuffer3 := bytes.Buffer{}
+// 	sizeOfUint32 := uint32(unsafe.Sizeof(fhSize)) // filehandle.size
+// 	k = 0
+// 	for k < sizeOfUint32 {
+// 		fidBuffer3.WriteByte(buf[j])
+// 		j += 1
+// 		k += 1
+// 	}
+// 	log.Printf("FID.file_handle.handle_bytes (%d) bytes, idx: %d", sizeOfUint32, j)
+// 	log.Print(hex.Dump(fidBuffer3.Bytes()))
+// 	binary.Read(bytes.NewReader(fidBuffer3.Bytes()), binary.LittleEndian, &fhSize)
+// 	log.Print("FID.file_handle.handle_bytes = ", fhSize)
+//
+// 	var fhType int32
+// 	sizeOfInt32 := uint32(unsafe.Sizeof(fhType)) // filehandle.type
+// 	fidBuffer4 := bytes.Buffer{}
+// 	k = 0
+// 	for k < sizeOfInt32 {
+// 		fidBuffer4.WriteByte(buf[j])
+// 		j += 1
+// 		k += 1
+// 	}
+// 	log.Printf("FID.file_handle.handle_type (%d) bytes, idx: %d", sizeOfInt32, j)
+// 	log.Print(hex.Dump(fidBuffer4.Bytes()))
+// 	binary.Read(bytes.NewReader(fidBuffer4.Bytes()), binary.LittleEndian, &fhType)
+// 	log.Print("FID.filehandle.handle_type = ", fhType)
+//
+// 	fidBuffer5 := bytes.Buffer{}
+// 	k = 0
+// 	for k < fhSize {
+// 		fidBuffer5.WriteByte(buf[j])
+// 		j += 1
+// 		k += 1
+// 	}
+// 	log.Printf("FID.file_handle.handle idx: %d", j)
+// 	log.Print(hex.Dump(fidBuffer5.Bytes()))
+// 	handle := unix.NewFileHandle(fhType, fidBuffer5.Bytes())
+//
+// 	return &handle
+// }
