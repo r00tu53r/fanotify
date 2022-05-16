@@ -74,12 +74,24 @@ func main() {
 	watch(watchDir)
 }
 
+// fileAccessedOrModified raises event when
+// (1) "file" is created or modified under the monitored directory.
+// The metadata.Fd is the file descriptor to the file created/modified.
+// (2) "file" is read
 func fileAccessedOrModified() (uint, uint64) {
 	flags := uint(unix.FAN_CLASS_NOTIF | unix.FD_CLOEXEC)
 	mask := uint64(unix.FAN_ACCESS | unix.FAN_MODIFY | unix.FAN_EVENT_ON_CHILD)
 	return flags, mask
 }
 
+// fileOrDirCreated raises event when "file" or "directory" is created under
+// the monitored directory. The FileHandle only has information about the
+// parent path and not the child that was created.
+//
+// NOTE (Caveat) the subdirectory created is not returned. Hence it does not
+// seem possible to selectively monitor subdirectories. The only
+// option is to use FAN_MARK_MOUNT or FAN_MARK_FILESYSTEM and then selectively
+// ignore
 func fileOrDirCreated() (uint, uint64) {
 	flags := uint(unix.FAN_CLASS_NOTIF | unix.FD_CLOEXEC | unix.FAN_REPORT_FID)
 	mask := uint64(unix.FAN_CREATE | unix.FAN_EVENT_ON_CHILD | unix.FAN_ONDIR)
@@ -121,7 +133,7 @@ func Mask(mask uint64) []string {
 func watch(watchDir string) {
 	var fd int
 
-	initFlags, markMaskFlags = fileOrDirCreated()
+	initFlags, markMaskFlags = fileAccessedOrModified()
 
 	// initialize fanotify certain flags need CAP_SYS_ADMIN
 	initFileStatusFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_LARGEFILE
@@ -235,33 +247,22 @@ func readEvents(fd, mountFd int) error {
 		case errno != nil:
 			return errno
 		}
-		// process events
 		i := 0
 		metadata = (*unix.FanotifyEventMetadata)(unsafe.Pointer(&buf[i]))
 		for FanotifyEventOK(metadata, n) {
 			if metadata.Vers != unix.FANOTIFY_METADATA_VERSION {
 				log.Fatalf("Incompatible fanotify version. Rebuild your code.")
 			}
-			// If fanotify_init was initialized with FAN_REPORT_FID then
+			// If FanotifyInit was initialized with FAN_REPORT_FID then
 			// expect metadata.Fd to be FAN_NOFD
 			if initFlags&unix.FAN_REPORT_FID != 0 && metadata.Fd != unix.FAN_NOFD {
 				log.Fatalf("Error FanotifyInit called with FAN_REPORT_FID. Unexpected Fd:", metadata.Fd)
 			}
 			if initFlags&unix.FAN_REPORT_FID != 0 {
+				log.Print("init flag has FAN_REPORT_FID set.")
 				fid = (*FanotifyEventInfoFID)(unsafe.Pointer(&buf[i+int(metadata.Metadata_len)]))
-				log.Println("FID (Struct):", fid)
-				var handle *unix.FileHandle
-				handle = getFileHandle(metadata.Metadata_len, buf[:], i)
-				log.Print("Handle:")
-				log.Print("Handle.Type:", handle.Type())
-				log.Print("Handle.Size:", handle.Size())
-				log.Print("Handle.Bytes:", handle.Bytes())
-				switch {
-				case fid.Header.InfoType == unix.FAN_EVENT_INFO_TYPE_FID:
-					log.Println("FAN_EVENT_INFO_TYPE_FID: identifies non directory object")
-				default:
-					log.Fatalf("Unexpected InfoType %d expected %d", fid.Header.InfoType, unix.FAN_EVENT_INFO_TYPE_FID)
-				}
+				handle := getFileHandle(metadata.Metadata_len, buf[:], i)
+				log.Printf("Handle type (%d), size (%d), bytes (%v)", handle.Type(), handle.Size(), handle.Bytes())
 				if fid.Header.InfoType == unix.FAN_EVENT_INFO_TYPE_FID {
 					fd, errno := unix.OpenByHandleAt(mountFd, *handle, unix.O_RDONLY)
 					if errno != nil {
@@ -273,20 +274,20 @@ func readEvents(fd, mountFd int) error {
 					}
 					fdPath := fmt.Sprintf("/proc/self/fd/%d", fd)
 					n1, errno := unix.Readlink(fdPath, name[:])
-					fname := string(name[:n1])
-					log.Printf("Path: %s; Mask: %s", fname, EventMask(metadata.Mask))
+					log.Printf("Path: %s; Mask: %s", string(name[:n1]), EventMask(metadata.Mask))
 					unix.Close(fd)
+				} else {
+					log.Fatalf("Unexpected InfoType %d expected %d", fid.Header.InfoType, unix.FAN_EVENT_INFO_TYPE_FID)
 				}
 			}
-			log.Println("FanotifyEventMetadata:", *metadata)
 			if metadata.Fd != unix.FAN_NOFD {
+				log.Print("init flag does not have FAN_REPORT_FID set.")
 				procFdPath := fmt.Sprintf("/proc/self/fd/%d", metadata.Fd)
 				n1, errno := unix.Readlink(procFdPath, name[:])
 				if errno != nil {
 					log.Fatalf("Readlink for path %s failed %v", procFdPath, errno)
 				}
-				fname := string(name[:n1])
-				log.Printf("Path: %s; Mask: %s", fname, EventMask(metadata.Mask))
+				log.Printf("Path: %s; Mask: %s", string(name[:n1]), EventMask(metadata.Mask))
 			}
 			i += int(metadata.Event_len)
 			n -= int(metadata.Event_len)
@@ -320,72 +321,3 @@ func EventMask(mask uint64) string {
 	}
 	return strings.Join(maskStr, ",")
 }
-
-// debug function to extract fileHandle from byte buffer
-// func debugGetFileHandle(metadata *unix.FanotifyEventMetadata, buf []byte, i int) *unix.FileHandle {
-// 	var j uint32
-// 	var k uint32
-//
-// 	fidBuffer := bytes.Buffer{}
-// 	j = uint32(i) + uint32(metadata.Metadata_len)
-// 	sizeOfFanotifyEventInfoHeader := uint32(unsafe.Sizeof(FanotifyEventInfoHeader{}))
-// 	for k < sizeOfFanotifyEventInfoHeader {
-// 		fidBuffer.WriteByte(buf[j])
-// 		j += 1
-// 		k += 1
-// 	}
-// 	log.Printf("FID.Header (%d) bytes. Idx: %d", sizeOfFanotifyEventInfoHeader, j)
-// 	log.Print(hex.Dump(fidBuffer.Bytes()))
-//
-// 	fidBuffer2 := bytes.Buffer{}
-// 	k = 0
-// 	sizeOfKernelFSIDType := uint32(unsafe.Sizeof(k) * 2)
-// 	for k < sizeOfKernelFSIDType {
-// 		fidBuffer2.WriteByte(buf[j])
-// 		j += 1
-// 		k += 1
-// 	}
-// 	log.Printf("FID.FSID (%d) bytes. Idx: %d", sizeOfKernelFSIDType, j)
-// 	log.Print(hex.Dump(fidBuffer2.Bytes()))
-//
-// 	var fhSize uint32
-// 	fidBuffer3 := bytes.Buffer{}
-// 	sizeOfUint32 := uint32(unsafe.Sizeof(fhSize)) // filehandle.size
-// 	k = 0
-// 	for k < sizeOfUint32 {
-// 		fidBuffer3.WriteByte(buf[j])
-// 		j += 1
-// 		k += 1
-// 	}
-// 	log.Printf("FID.file_handle.handle_bytes (%d) bytes, idx: %d", sizeOfUint32, j)
-// 	log.Print(hex.Dump(fidBuffer3.Bytes()))
-// 	binary.Read(bytes.NewReader(fidBuffer3.Bytes()), binary.LittleEndian, &fhSize)
-// 	log.Print("FID.file_handle.handle_bytes = ", fhSize)
-//
-// 	var fhType int32
-// 	sizeOfInt32 := uint32(unsafe.Sizeof(fhType)) // filehandle.type
-// 	fidBuffer4 := bytes.Buffer{}
-// 	k = 0
-// 	for k < sizeOfInt32 {
-// 		fidBuffer4.WriteByte(buf[j])
-// 		j += 1
-// 		k += 1
-// 	}
-// 	log.Printf("FID.file_handle.handle_type (%d) bytes, idx: %d", sizeOfInt32, j)
-// 	log.Print(hex.Dump(fidBuffer4.Bytes()))
-// 	binary.Read(bytes.NewReader(fidBuffer4.Bytes()), binary.LittleEndian, &fhType)
-// 	log.Print("FID.filehandle.handle_type = ", fhType)
-//
-// 	fidBuffer5 := bytes.Buffer{}
-// 	k = 0
-// 	for k < fhSize {
-// 		fidBuffer5.WriteByte(buf[j])
-// 		j += 1
-// 		k += 1
-// 	}
-// 	log.Printf("FID.file_handle.handle idx: %d", j)
-// 	log.Print(hex.Dump(fidBuffer5.Bytes()))
-// 	handle := unix.NewFileHandle(fhType, fidBuffer5.Bytes())
-//
-// 	return &handle
-// }
