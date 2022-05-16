@@ -84,6 +84,27 @@ func fileAccessedOrModified() (uint, uint64) {
 	return flags, mask
 }
 
+// fileCloseWriteNoWrite raises event when
+// (1) "file" is accessed / read and closed then "close-no-write" is
+// raised.
+// (2) "file" is written or updated and closed then "close-write" is
+// raised.
+// NOTE multiple close-no-writes are raised for files opened by editors
+func fileCloseWriteNoWrite() (uint, uint64) {
+	flags := uint(unix.FAN_CLASS_NOTIF | unix.FD_CLOEXEC)
+	mask := uint64(unix.FAN_CLOSE_WRITE | unix.FAN_CLOSE_NOWRITE | unix.FAN_EVENT_ON_CHILD)
+	return flags, mask
+}
+
+// fileOpenExec raises event when
+// (1) if "file" is opened raises FAN_OPEN
+// (2) if "file" is executed raises FAN_OPEN and FAN_OPEN_EXEC
+func fileOpenExec() (uint, uint64) {
+	flags := uint(unix.FAN_CLASS_NOTIF | unix.FD_CLOEXEC)
+	mask := uint64(unix.FAN_OPEN | unix.FAN_OPEN_EXEC | unix.FAN_EVENT_ON_CHILD)
+	return flags, mask
+}
+
 // fileOrDirCreated raises event when "file" or "directory" is created under
 // the monitored directory. The FileHandle only has information about the
 // parent path and not the child that was created.
@@ -98,42 +119,101 @@ func fileOrDirCreated() (uint, uint64) {
 	return flags, mask
 }
 
-func Mask(mask uint64) []string {
-	var maskTable = map[int]string{
-		unix.FAN_ACCESS:         "Create an event when a file or directory (but see BUGS) is accessed (read)",
-		unix.FAN_MODIFY:         "Create an event when a file is modified (write).",
-		unix.FAN_ONDIR:          "Create events for directories when readdir, opendir, closedir are called",
-		unix.FAN_EVENT_ON_CHILD: "Events for the immediate children of marked directories shall be created",
-		unix.FAN_CLOSE_WRITE:    "Create an event when a writable file is closed.",
-		unix.FAN_CLOSE_NOWRITE:  "Create an event when a read-only file or directory is closed.",
-		unix.FAN_OPEN:           "Create an event when a file or directory is opened.",
-		unix.FAN_OPEN_EXEC:      "Create  an  event  when a file is opened with the intent to be executed.",
-		unix.FAN_ATTRIB:         "Create an event when the metadata for a file or directory has changed.",
-		unix.FAN_CREATE:         "Create an event when a file or directory has been created in a marked parent directory.",
-		unix.FAN_DELETE:         "Create an event when a file or directory has been deleted in a marked parent directory.",
-		unix.FAN_DELETE_SELF:    "Create an event when a marked file or directory itself is deleted.",
-		unix.FAN_MOVED_FROM:     "Create an event when a file or directory has been moved from a marked parent directory.",
-		unix.FAN_MOVED_TO:       "Create an event when a file or directory has been moved to a marked parent directory.",
-		unix.FAN_MOVE_SELF:      "Create an event when a marked file or directory itself has been moved.",
+func MaskValues(m uint64) []string {
+	return mask(m, true)
+}
+
+func MaskDescriptions(m uint64) []string {
+	return mask(m, false)
+}
+
+func mask(mask uint64, values bool) []string {
+	var maskTable = map[int]struct {
+		value string
+		desc  string
+	}{
+		unix.FAN_ACCESS: {
+			"access",
+			"Create an event when a file or directory (but see BUGS) is accessed (read)",
+		},
+		unix.FAN_MODIFY: {
+			"modify",
+			"Create an event when a file is modified (write).",
+		},
+		unix.FAN_ONDIR: {
+			"ondir",
+			"Create events for directories when readdir, opendir, closedir are called",
+		},
+		unix.FAN_EVENT_ON_CHILD: {
+			"onchild",
+			"Events for the immediate children of marked directories shall be created",
+		},
+		unix.FAN_CLOSE_WRITE: {
+			"close-write",
+			"Create an event when a writable file is closed.",
+		},
+		unix.FAN_CLOSE_NOWRITE: {
+			"close-no-write",
+			"Create an event when a read-only file or directory is closed.",
+		},
+		unix.FAN_OPEN: {
+			"open",
+			"Create an event when a file or directory is opened.",
+		},
+		unix.FAN_OPEN_EXEC: {
+			"exec",
+			"Create an event when a file is opened with the intent to be executed.",
+		},
+		unix.FAN_ATTRIB: {
+			"attrib",
+			"Create an event when the metadata for a file or directory has changed.",
+		},
+		unix.FAN_CREATE: {
+			"create",
+			"Create an event when a file or directory has been created in a marked parent directory.",
+		},
+		unix.FAN_DELETE: {
+			"delete",
+			"Create an event when a file or directory has been deleted in a marked parent directory.",
+		},
+		unix.FAN_DELETE_SELF: {
+			"delete-self",
+			"Create an event when a marked file or directory itself is deleted.",
+		},
+		unix.FAN_MOVED_FROM: {
+			"moved-from",
+			"Create an event when a file or directory has been moved from a marked parent directory.",
+		},
+		unix.FAN_MOVED_TO: {
+			"moved-to",
+			"Create an event when a file or directory has been moved to a marked parent directory.",
+		},
+		unix.FAN_MOVE_SELF: {
+			"move-self",
+			"Create an event when a marked file or directory itself has been moved.",
+		},
 	}
-	getDesc := func(m uint64) []string {
+	maskValues := func(m uint64) []string {
 		var ret []string
 		for k, v := range maskTable {
 			if m&uint64(k) != 0 {
-				ret = append(ret, v)
+				if values {
+					ret = append(ret, v.value)
+				} else {
+					ret = append(ret, v.desc)
+				}
 			}
 		}
 		return ret
 	}
-	desc := getDesc(mask)
-	return desc
+	return maskValues(mask)
 }
 
 // watch watches only the specified directory
 func watch(watchDir string) {
 	var fd int
 
-	initFlags, markMaskFlags = fileAccessedOrModified()
+	initFlags, markMaskFlags = fileOpenExec()
 
 	// initialize fanotify certain flags need CAP_SYS_ADMIN
 	initFileStatusFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_LARGEFILE
@@ -144,7 +224,7 @@ func watch(watchDir string) {
 
 	// fanotify_mark
 	markFlags = unix.FAN_MARK_ADD
-	desc := Mask(markMaskFlags)
+	desc := MaskDescriptions(markMaskFlags)
 	errno = unix.FanotifyMark(fd, markFlags, markMaskFlags, -1, watchDir)
 	if errno != nil {
 		log.Fatalf("FanotifyMark: %v", errno)
@@ -274,7 +354,7 @@ func readEvents(fd, mountFd int) error {
 					}
 					fdPath := fmt.Sprintf("/proc/self/fd/%d", fd)
 					n1, errno := unix.Readlink(fdPath, name[:])
-					log.Printf("Path: %s; Mask: %s", string(name[:n1]), EventMask(metadata.Mask))
+					log.Printf("Path: %s; Mask: %s", string(name[:n1]), MaskValues(metadata.Mask))
 					unix.Close(fd)
 				} else {
 					log.Fatalf("Unexpected InfoType %d expected %d", fid.Header.InfoType, unix.FAN_EVENT_INFO_TYPE_FID)
@@ -287,37 +367,11 @@ func readEvents(fd, mountFd int) error {
 				if errno != nil {
 					log.Fatalf("Readlink for path %s failed %v", procFdPath, errno)
 				}
-				log.Printf("Path: %s; Mask: %s", string(name[:n1]), EventMask(metadata.Mask))
+				log.Printf("Path: %s; Mask: %s", string(name[:n1]), MaskValues(metadata.Mask))
 			}
 			i += int(metadata.Event_len)
 			n -= int(metadata.Event_len)
 			metadata = (*unix.FanotifyEventMetadata)(unsafe.Pointer(&buf[i]))
 		}
 	}
-}
-
-var masks = map[int]string{
-	unix.FAN_ACCESS:        "access",
-	unix.FAN_MODIFY:        "modify",
-	unix.FAN_CLOSE_WRITE:   "close-write",
-	unix.FAN_CLOSE_NOWRITE: "close-no-write",
-	unix.FAN_OPEN:          "open",
-	unix.FAN_OPEN_EXEC:     "exec",
-	unix.FAN_ATTRIB:        "attrib",
-	unix.FAN_CREATE:        "create",
-	unix.FAN_DELETE:        "delete",
-	unix.FAN_DELETE_SELF:   "delete-self",
-	unix.FAN_MOVED_FROM:    "moved-from",
-	unix.FAN_MOVED_TO:      "moved-to",
-	unix.FAN_MOVE_SELF:     "move-self",
-}
-
-func EventMask(mask uint64) string {
-	var maskStr []string
-	for m, s := range masks {
-		if uint64(m)&mask != 0 {
-			maskStr = append(maskStr, s)
-		}
-	}
-	return strings.Join(maskStr, ",")
 }
