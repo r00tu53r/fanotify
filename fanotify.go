@@ -117,13 +117,25 @@ func fileAttribChange() (uint, uint64) {
 // the monitored directory. The FileHandle only has information about the
 // parent path and not the child that was created.
 //
-// NOTE (Caveat) the subdirectory created is not returned. Hence it does not
-// seem possible to selectively monitor subdirectories. The only
+// NOTE (Caveat) the subdirectory created is not returned. Hence it is not
+// possible to selectively monitor subdirectories. The only
 // option is to use FAN_MARK_MOUNT or FAN_MARK_FILESYSTEM and then selectively
 // ignore
 func fileOrDirCreated() (uint, uint64) {
 	flags := uint(unix.FAN_CLASS_NOTIF | unix.FD_CLOEXEC | unix.FAN_REPORT_FID)
 	mask := uint64(unix.FAN_CREATE | unix.FAN_EVENT_ON_CHILD | unix.FAN_ONDIR)
+	return flags, mask
+}
+
+// fileDeleteSelf raises event when
+// (1) file or directory under the marked directory is deleted.
+// (2) the marked directory itself is deleted
+//
+// NOTE (Caveat) when the marked directory is deleted the event
+// file handle becomes stale and the event escapes
+func fileDeleteSelf() (uint, uint64) {
+	flags := uint(unix.FAN_CLASS_NOTIF | unix.FD_CLOEXEC | unix.FAN_REPORT_FID)
+	mask := uint64(unix.FAN_DELETE | unix.FAN_DELETE_SELF | unix.FAN_ONDIR)
 	return flags, mask
 }
 
@@ -221,7 +233,7 @@ func mask(mask uint64, values bool) []string {
 func watch(watchDir string) {
 	var fd int
 
-	initFlags, markMaskFlags = fileAttribChange()
+	initFlags, markMaskFlags = fileDeleteSelf()
 
 	// initialize fanotify certain flags need CAP_SYS_ADMIN
 	initFileStatusFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_LARGEFILE
