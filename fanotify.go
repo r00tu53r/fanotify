@@ -105,6 +105,14 @@ func fileOpenExec() (uint, uint64) {
 	return flags, mask
 }
 
+// fileAttribChange raises event when file's attribute is changed
+// NOTE does not detect changes to extended attributes
+func fileAttribChange() (uint, uint64) {
+	flags := uint(unix.FAN_CLASS_NOTIF | unix.FD_CLOEXEC | unix.FAN_REPORT_FID)
+	mask := uint64(unix.FAN_ATTRIB | unix.FAN_EVENT_ON_CHILD)
+	return flags, mask
+}
+
 // fileOrDirCreated raises event when "file" or "directory" is created under
 // the monitored directory. The FileHandle only has information about the
 // parent path and not the child that was created.
@@ -213,7 +221,7 @@ func mask(mask uint64, values bool) []string {
 func watch(watchDir string) {
 	var fd int
 
-	initFlags, markMaskFlags = fileOpenExec()
+	initFlags, markMaskFlags = fileAttribChange()
 
 	// initialize fanotify certain flags need CAP_SYS_ADMIN
 	initFileStatusFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_LARGEFILE
